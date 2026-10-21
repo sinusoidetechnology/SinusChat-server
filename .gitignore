@@ -1,0 +1,14 @@
+node_modules/
+.env
+*.env
+*.log
+uploads/
+config.php
+fcm.json
+*service-account*.json
+client_secret*.json
+*.pem
+*.key
+*.p12
+*.sql.gz
+dump*.sql
