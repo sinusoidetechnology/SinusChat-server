@@ -522,7 +522,7 @@ async function isBlockedBy(blockerHash, blockedHash) {
   } catch (_) { return false }
 }
 
-const GROUP_AVATAR_RE = /^https:\/\/files\.sinusoide\.pl\/api\/uploads\/group_avatars\/[0-9a-f]{32}\.(jpg|png|webp)$/
+const GROUP_AVATAR_RE = /^https:\/\/files\.sinusoide\.pl\/api\/uploads\/group_avatars\/[0-9a-f]{32}\.(jpg|png|webp|bin)(\?v=\d{1,16})?$/
 function cleanGroupAvatarUrl(url) {
   if (url === '') return ''
   if (typeof url !== 'string') return undefined
