@@ -117,6 +117,15 @@ app.setErrorHandler((err, req, reply) => {
   return reply.code(status).send({ error: err.message || 'Błędne żądanie' })
 })
 
+app.addHook('onSend', async (req, reply, payload) => {
+  reply.header('Strict-Transport-Security', 'max-age=31536000; includeSubDomains')
+  reply.header('X-Content-Type-Options', 'nosniff')
+  if (!reply.hasHeader('content-security-policy')) {
+    reply.header('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'")
+  }
+  return payload
+})
+
 const QUEUE_BUDGET = new Map()
 function spendBudget(key, bytes, limit) {
   const now = Date.now()
