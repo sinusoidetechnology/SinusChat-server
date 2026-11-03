@@ -52,7 +52,7 @@ const UPLOAD_TOKEN_SECRET = requiredEnv('UPLOAD_TOKEN_SECRET')
 const NTFY_BASE   = process.env.NTFY_URL || 'https://ntfy.sh'
 const TURN_HOST   = process.env.TURN_HOST || 'turn.sinusoide.pl'
 const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || 'https://api.sinusoide.pl').replace(/\/+$/, '')
-const VOICE_DIR      = '/opt/sinuschat/uploads/voice'
+const LEGACY_VOICE_DIR = '/opt/sinuschat/uploads/voice'
 
 const FCM_SERVICE_ACCOUNT_FILE = process.env.FCM_SERVICE_ACCOUNT_FILE || ''
 
@@ -164,10 +164,8 @@ setInterval(() => {
 const MESSAGE_MAX_BYTES   = 512 * 1024
 const SENDER_BUDGET_BYTES = 200 * 1024 * 1024
 const SEALED_BUDGET_BYTES = 50 * 1024 * 1024
-const VOICE_BUDGET_BYTES  = 100 * 1024 * 1024
 app.register(require('@fastify/cors'), { origin: true })
 app.register(require('@fastify/websocket'))
-app.addContentTypeParser('audio/ogg', { parseAs: 'buffer' }, (req, body, done) => done(null, body))
 
 const db = new pg.Pool({ connectionString: DB_URL })
 db.on('error', (err) => console.error('[DB]', err.message))
@@ -360,8 +358,11 @@ setInterval(() => {
 const CALL_ACK_TIMEOUT_MS = 4_000
 
 const allSockets = new Set()
+const BG_PING_EVERY = 6
 setInterval(() => {
   for (const ws of allSockets) {
+    ws.pingTick = (ws.pingTick || 0) + 1
+    if (ws.background && ws.pingTick % BG_PING_EVERY !== 0) continue
     if (ws.heartbeatAlive === false) { try { ws.terminate() } catch (_) {} ; continue }
     ws.heartbeatAlive = false
     try { ws.ping() } catch (_) {}
@@ -464,24 +465,16 @@ async function purgeOldMessages() {
 }
 setInterval(purgeOldMessages, 60 * 60 * 1000)
 
-function purgeOldVoice() {
+function removeLegacyVoice() {
   const fs = require('fs')
   try {
-    if (!fs.existsSync(VOICE_DIR)) return
-    const cutoff = Date.now() - MESSAGE_TTL_MS
-    let removed = 0
-    for (const name of fs.readdirSync(VOICE_DIR)) {
-      const p = `${VOICE_DIR}/${name}`
-      try {
-        if (fs.statSync(p).mtimeMs < cutoff) { fs.unlinkSync(p); removed++ }
-      } catch (_) {}
-    }
-    if (removed > 0) console.log('[PURGE] usunięto głosówek:', removed)
+    if (!fs.existsSync(LEGACY_VOICE_DIR)) return
+    fs.rmSync(LEGACY_VOICE_DIR, { recursive: true, force: true })
+    console.log('[PURGE] usunięto stary katalog głosówek z VPS')
   } catch (e) {
-    console.error('[PURGE] błąd czyszczenia głosówek:', e.message)
+    console.error('[PURGE] błąd usuwania starych głosówek:', e.message)
   }
 }
-setInterval(purgeOldVoice, 60 * 60 * 1000)
 
 async function migrateAvatarNames() {
   try {
@@ -503,7 +496,7 @@ async function migrateAvatarNames() {
 }
 
 const schemaReady = ensureSchema().then(migrateAvatarNames)
-schemaReady.then(purgeOldMessages).then(purgeOldVoice)
+schemaReady.then(purgeOldMessages).then(removeLegacyVoice)
   .then(() => setTimeout(purgeScheduledAccounts, 30_000))
 
 const WS_MSG_LIMIT = 40
@@ -2720,42 +2713,6 @@ app.get('/api/upload-token', async (req, reply) => {
   return { token: `${data}.${hmac}`, expires_at: expiry }
 })
 
-app.post('/api/upload-voice', { config: { rawBody: true } }, async (req, reply) => {
-  const auth = req.headers.authorization?.replace('Bearer ', '')
-  const payload = await verifyActiveDevice(auth)
-  if (!payload) return reply.code(401).send({ error: 'Brak autoryzacji' })
-  if (payload.kicked) return reply.code(409).send({ error: 'device_kicked', kicked: true })
-
-  if (getFreeDiskGB() < MIN_FREE_GB) return reply.code(507).send({ error: 'Brak miejsca' })
-
-  require('fs').mkdirSync(VOICE_DIR, { recursive: true })
-  const fileName = `${crypto.randomBytes(16).toString('hex')}.ogg`
-  const filePath = `${VOICE_DIR}/${fileName}`
-
-  const body = await req.body
-  if (!body) return reply.code(400).send({ error: 'Brak danych' })
-  if (!spendBudget('v:' + payload.sub, body.length, VOICE_BUDGET_BYTES)) {
-    return reply.code(429).send({ error: 'Za dużo głosówek w krótkim czasie — spróbuj później' })
-  }
-  require('fs').writeFileSync(filePath, body)
-
-  return { ok: true, url: `${PUBLIC_API_URL}/api/voice/${fileName}` }
-})
-
-app.get('/api/voice/:filename', async (req, reply) => {
-  const auth = req.headers.authorization?.replace('Bearer ', '')
-  const payload = await verifyActiveDevice(auth)
-  if (!payload) return reply.code(401).send({ error: 'Brak autoryzacji' })
-  if (payload.kicked) return reply.code(409).send({ error: 'device_kicked', kicked: true })
-  const filename = String(req.params.filename || '')
-  if (!/^[A-Za-z0-9_-]{1,80}\.(ogg|opus|m4a|mp3)$/.test(filename)) {
-    return reply.code(400).send({ error: 'Nieprawidłowa nazwa pliku' })
-  }
-  const filePath = `${VOICE_DIR}/${filename}`
-  if (!require('fs').existsSync(filePath)) return reply.code(404).send({ error: 'Nie znaleziono' })
-  return reply.sendFile(filename, VOICE_DIR)
-})
-
 const FILES_ORIGIN = 'https://files.sinusoide.pl/api/'
 const FILES_RELAY_PATH = /^\/api\/files\/(upload\.php|auth\.php|uploads\/(?:avatars|group_avatars)\/[0-9a-f]{32,64}\.(?:jpg|png|webp|bin)|models\/translate\/(?:model|vocab|lex)\.[a-z0-9.]+\.(?:bin|spm)\.gz)$/
 const FILES_RELAY_MAX = 52 * 1024 * 1024
@@ -3352,6 +3309,13 @@ app.register(async function (app) {
       if (!userHash) return
 
       if (msg.type === 'ping') { socket.send(JSON.stringify({ type: 'pong' })); return }
+
+      if (msg.type === 'bg') {
+        socket.background = msg.on === true
+        socket.heartbeatAlive = true
+        socket.pingTick = 0
+        return
+      }
 
       if (typeof msg.type === 'string' && msg.type.startsWith('gcall_')) {
         const gid = String(msg.conversationId || '')
