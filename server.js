@@ -45,6 +45,8 @@ function requiredEnv(name) {
 }
 
 const PORT        = process.env.PORT || 3000
+const SERVER_BOOT = Date.now()
+const SERVER_CAPS = ['group_sealed']
 const DB_URL      = requiredEnv('DATABASE_URL')
 const JWT_SECRET  = requiredEnv('JWT_SECRET')
 const TURN_SECRET = requiredEnv('TURN_SECRET')
@@ -52,7 +54,6 @@ const UPLOAD_TOKEN_SECRET = requiredEnv('UPLOAD_TOKEN_SECRET')
 const NTFY_BASE   = process.env.NTFY_URL || 'https://ntfy.sh'
 const TURN_HOST   = process.env.TURN_HOST || 'turn.sinusoide.pl'
 const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || 'https://api.sinusoide.pl').replace(/\/+$/, '')
-const LEGACY_VOICE_DIR = '/opt/sinuschat/uploads/voice'
 
 const FCM_SERVICE_ACCOUNT_FILE = process.env.FCM_SERVICE_ACCOUNT_FILE || ''
 
@@ -104,14 +105,13 @@ app.register(require('@fastify/rate-limit'), {
 })
 
 app.register(require('@fastify/multipart'))
-app.register(require('@fastify/static'), { root: '/opt/sinuschat/uploads', serve: false })
 
 app.setErrorHandler((err, req, reply) => {
   const status = Number(err.statusCode) || (reply.statusCode >= 400 ? reply.statusCode : 500)
   if (status === 429) return reply.code(429).send({ error: 'Za dużo żądań — spróbuj za chwilę' })
   if (status >= 500) {
     const route = (req.routeOptions && req.routeOptions.url) || req.routerPath || ''
-    console.error('[ERR]', req.method, route, err.message)
+    console.error('[ERR]', req.method, route, scrubLog(err.message))
     return reply.code(500).send({ error: 'Błąd serwera' })
   }
   return reply.code(status).send({ error: err.message || 'Błędne żądanie' })
@@ -168,7 +168,15 @@ app.register(require('@fastify/cors'), { origin: true })
 app.register(require('@fastify/websocket'))
 
 const db = new pg.Pool({ connectionString: DB_URL })
-db.on('error', (err) => console.error('[DB]', err.message))
+db.on('error', (err) => console.error('[DB]', scrubLog(err.message)))
+
+function scrubLog(text) {
+  return String(text || '')
+    .replace(/[^\s@]+@[^\s@]+/g, '<email>')
+    .replace(/[0-9a-f]{16,}/gi, '<id>')
+    .replace(/\b\d{1,3}(\.\d{1,3}){3}\b/g, '<ip>')
+    .slice(0, 300)
+}
 
 async function ensureSchema() {
   const stmts = [
@@ -220,6 +228,7 @@ async function ensureSchema() {
     `UPDATE bug_reports SET status = 'pending'   WHERE status IN ('new', 'in_progress')`,
     `UPDATE bug_reports SET status = 'confirmed' WHERE status = 'resolved'`,
     `ALTER TABLE bug_reports ADD COLUMN IF NOT EXISTS decided_at bigint`,
+    `ALTER TABLE bug_reports ADD COLUMN IF NOT EXISTS platform varchar(24)`,
     `CREATE TABLE IF NOT EXISTS contact_invites (
        code        varchar(48) PRIMARY KEY,
        owner_hash  varchar(64) NOT NULL,
@@ -283,7 +292,10 @@ async function ensureSchema() {
     `UPDATE users SET last_active_day = ((extract(epoch from now()) * 1000)::bigint / 86400000)::integer
       WHERE last_active_day IS NULL`,
     `UPDATE users SET last_heartbeat_ms = 0, last_seen_ms = 0
-      WHERE COALESCE(last_heartbeat_ms,0) <> 0 OR COALESCE(last_seen_ms,0) <> 0`
+      WHERE COALESCE(last_heartbeat_ms,0) <> 0 OR COALESCE(last_seen_ms,0) <> 0`,
+    `CREATE TABLE IF NOT EXISTS server_flags (name varchar(64) PRIMARY KEY)`,
+    `ALTER TABLE blocked_users ALTER COLUMN blocked_at DROP DEFAULT`,
+    `UPDATE blocked_users SET blocked_at = NULL WHERE blocked_at IS NOT NULL`
   ]
   let failed = 0
   for (const sql of stmts) {
@@ -365,13 +377,52 @@ setInterval(() => {
     if (ws.background && ws.pingTick % BG_PING_EVERY !== 0) continue
     if (ws.heartbeatAlive === false) { try { ws.terminate() } catch (_) {} ; continue }
     ws.heartbeatAlive = false
-    try { ws.ping() } catch (_) {}
+    wsPing(ws)
   }
 }, 30_000)
+
+const DELIVERY_PROBE_MS = 15_000
+const probingSockets = new Set()
+
+function wsPing(ws) {
+  ws.pingSeq = (ws.pingSeq || 0) + 1
+  try { ws.ping(String(ws.pingSeq)) } catch (_) {}
+  return ws.pingSeq
+}
+
+function onWsPong(ws, data) {
+  ws.heartbeatAlive = true
+  if (!ws.probes || !ws.probes.length) return
+  const seq = Number(data && data.toString()) || 0
+  const done = seq > 0 ? ws.probes.filter(p => p.seq <= seq) : ws.probes
+  ws.probes = seq > 0 ? ws.probes.filter(p => p.seq > seq) : []
+  if (!ws.probes.length) probingSockets.delete(ws)
+  for (const p of done) if (p.onOk) Promise.resolve().then(p.onOk).catch(() => {})
+}
+
+async function failProbes(ws, wake) {
+  const lost = ws.probes || []
+  ws.probes = []
+  probingSockets.delete(ws)
+  if (!lost.length) return
+  console.warn(`[DELIVERY] brak potwierdzenia, ${lost.length} ramek wraca do kolejki`)
+  await Promise.all(lost.map(p => Promise.resolve().then(() => p.onLost(wake)).catch(() => {})))
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - DELIVERY_PROBE_MS
+  for (const ws of probingSockets) {
+    if (!ws.probes || !ws.probes.length) { probingSockets.delete(ws); continue }
+    if (ws.probes[0].at > cutoff) continue
+    failProbes(ws, true)
+    try { ws.terminate() } catch (_) {}
+  }
+}, 5_000)
 
 const MESSAGE_TTL_MS = 24 * 60 * 60 * 1000
 
 const NOTIFIABLE_KINDS = new Set(['msg', 'group_attach'])
+const URGENT_WAKE_KINDS = new Set(['msg', 'group_attach', 'sealed', 'call', 'kicked', 'expiry_notice'])
 
 function baseMessageId(rowId) {
   return String(rowId).replace(/_[0-9a-f]{16}$/, '')
@@ -440,13 +491,10 @@ async function purgeOldMessages() {
         )
 
         const payloadB64 = noticeBody.toString('base64')
-        const live = sendToUser(e.senderHash, {
+        await deliverRow(e.senderHash, noticeId, {
           type: 'message', conversationId: e.conversationId, id: noticeId,
           kind: 'expiry_notice', payloadB64, senderHash: e.senderHash, createdAt: now
-        })
-        if (live) {
-          await db.query('UPDATE messages SET delivered_at=$1 WHERE id=$2', [now, noticeId])
-        }
+        }, null, now)
       } catch (inner) {
         console.error('[PURGE] powiadomienie nadawcy nie powiodło się:', inner.message)
       }
@@ -464,17 +512,6 @@ async function purgeOldMessages() {
   }
 }
 setInterval(purgeOldMessages, 60 * 60 * 1000)
-
-function removeLegacyVoice() {
-  const fs = require('fs')
-  try {
-    if (!fs.existsSync(LEGACY_VOICE_DIR)) return
-    fs.rmSync(LEGACY_VOICE_DIR, { recursive: true, force: true })
-    console.log('[PURGE] usunięto stary katalog głosówek z VPS')
-  } catch (e) {
-    console.error('[PURGE] błąd usuwania starych głosówek:', e.message)
-  }
-}
 
 async function migrateAvatarNames() {
   try {
@@ -495,8 +532,62 @@ async function migrateAvatarNames() {
   }
 }
 
-const schemaReady = ensureSchema().then(migrateAvatarNames)
-schemaReady.then(purgeOldMessages).then(removeLegacyVoice)
+const BLOCK_SECRET = process.env.BLOCK_SECRET || null
+let blocksTagged = false
+
+function blockTag(hash) {
+  return crypto.createHmac('sha256', BLOCK_SECRET).update('block|' + String(hash)).digest('hex')
+}
+
+function bt(hash) {
+  return blocksTagged ? blockTag(hash) : hash
+}
+
+async function migrateBlockTags() {
+  let done = false
+  try {
+    const { rows } = await db.query("SELECT 1 FROM server_flags WHERE name='blocks_tagged'")
+    done = rows.length > 0
+  } catch (e) {
+    console.error('[BLOCKS] odczyt stanu blokad nieudany:', scrubLog(e.message))
+    return
+  }
+  if (done && !BLOCK_SECRET) {
+    console.error('[FATAL] Blokady są zaszyfrowane, a brakuje BLOCK_SECRET — nie startuję.')
+    process.exit(1)
+  }
+  if (!BLOCK_SECRET) {
+    console.warn('[UWAGA] Brak BLOCK_SECRET — blokady leżą w bazie jawnie.')
+    return
+  }
+  if (done) {
+    blocksTagged = true
+    return
+  }
+  const client = await db.connect()
+  try {
+    await client.query('BEGIN')
+    const { rows: all } = await client.query('SELECT blocker_hash, blocked_hash FROM blocked_users')
+    await client.query('DELETE FROM blocked_users')
+    for (const r of all) {
+      await client.query(
+        'INSERT INTO blocked_users(blocker_hash, blocked_hash, blocked_at) VALUES($1,$2,NULL) ON CONFLICT DO NOTHING',
+        [blockTag(r.blocker_hash), blockTag(r.blocked_hash)])
+    }
+    await client.query("INSERT INTO server_flags(name) VALUES('blocks_tagged') ON CONFLICT DO NOTHING")
+    await client.query('COMMIT')
+    blocksTagged = true
+    console.log('[BLOCKS] zaszyfrowano blokady:', all.length)
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {})
+    console.error('[BLOCKS] szyfrowanie blokad nieudane, zostają jawne:', scrubLog(e.message))
+  } finally {
+    client.release()
+  }
+}
+
+const schemaReady = ensureSchema().then(migrateAvatarNames).then(migrateBlockTags)
+schemaReady.then(purgeOldMessages)
   .then(() => setTimeout(purgeScheduledAccounts, 30_000))
 
 const WS_MSG_LIMIT = 40
@@ -513,12 +604,39 @@ function sendToUser(userHash, data) {
   return false
 }
 
+function sendConfirmed(userHash, data, onLost, onOk) {
+  const ws = connections.get(userHash)
+  if (!ws || ws.readyState !== 1) return false
+  try { ws.send(JSON.stringify(data)) } catch (_) { return false }
+  if (!ws.probes) ws.probes = []
+  ws.probes.push({ seq: wsPing(ws), at: Date.now(), onLost, onOk })
+  probingSockets.add(ws)
+  return true
+}
+
+async function deliverRow(userHash, rowId, frame, wakeKind, now) {
+  let marked = null
+  const group = String(frame.conversationId || '').startsWith('g_')
+  const live = sendConfirmed(userHash, frame, async (wake) => {
+    await marked
+    const r = await db.query('UPDATE messages SET delivered_at=NULL WHERE id=$1', [rowId])
+    if (r.rowCount && wake && wakeKind) wakeUser(userHash, wakeKind).catch(() => {})
+  }, group ? null : async () => {
+    await marked
+    await db.query('DELETE FROM messages WHERE id=$1 AND delivered_at IS NOT NULL', [rowId])
+  })
+  if (!live) return false
+  marked = db.query('UPDATE messages SET delivered_at=$1 WHERE id=$2', [now, rowId]).catch(() => {})
+  await marked
+  return true
+}
+
 async function isBlockedBy(blockerHash, blockedHash) {
   if (!blockerHash || !blockedHash) return false
   try {
     const { rows } = await db.query(
       'SELECT 1 FROM blocked_users WHERE blocker_hash=$1 AND blocked_hash=$2 LIMIT 1',
-      [blockerHash, blockedHash]
+      [bt(blockerHash), bt(blockedHash)]
     )
     return rows.length > 0
   } catch (_) { return false }
@@ -560,6 +678,19 @@ function accessKeyMatches(uaHash, akB64) {
   if (!uaHash || typeof akB64 !== 'string' || !akB64 || akB64.length > 64) return false
   const got = crypto.createHash('sha256').update(Buffer.from(akB64, 'base64')).digest('hex')
   return got.length === uaHash.length && crypto.timingSafeEqual(Buffer.from(got), Buffer.from(uaHash))
+}
+
+const PRESENCE_LEGACY_UNTIL = Date.parse('2026-12-15T00:00:00Z')
+
+async function groupPeersOf(me, hashes) {
+  try {
+    const { rows } = await db.query(
+      `SELECT DISTINCT cp2.user_hash FROM conversation_participants cp1
+       JOIN conversation_participants cp2 ON cp1.conversation_id = cp2.conversation_id
+       WHERE cp1.user_hash = $1 AND cp2.user_hash = ANY($2::varchar[]) AND cp1.conversation_id LIKE 'g!_%' ESCAPE '!'`,
+      [me, hashes])
+    return new Set(rows.map(r => r.user_hash))
+  } catch (_) { return new Set() }
 }
 
 async function sharesGroup(a, b) {
@@ -659,7 +790,12 @@ async function relayDirectAck(fromHash, conversationId, deliveredUpTo, readUpTo)
   const other = parts[0] === fromHash ? parts[1] : parts[0]
   if (!other || other === fromHash) return
   if (await isBlockedBy(fromHash, other)) return
-  if (sendToUser(other, { type: 'ack', conversationId, fromHash, deliveredUpTo: d || undefined, readUpTo: r || undefined })) return
+  const frame = { type: 'ack', conversationId, fromHash, deliveredUpTo: d || undefined, readUpTo: r || undefined }
+  if (sendConfirmed(other, frame, () => queueDirectAck(fromHash, other, conversationId, d, r))) return
+  await queueDirectAck(fromHash, other, conversationId, d, r)
+}
+
+async function queueDirectAck(fromHash, other, conversationId, d, r) {
   if (!(await userExists(other))) return
   try {
     let md = d, mr = r
@@ -777,7 +913,7 @@ async function sendFcm(userHash, fcmToken, kind) {
   try {
     const access = await fcmGetAccessToken()
     if (!access) return false
-    void kind
+    const urgent = URGENT_WAKE_KINDS.has(kind || 'msg')
     const res = await fetch(`https://fcm.googleapis.com/v1/projects/${acc.project_id}/messages:send`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${access}`, 'Content-Type': 'application/json' },
@@ -785,7 +921,7 @@ async function sendFcm(userHash, fcmToken, kind) {
         token: fcmToken,
         data: { w: '1' },
         android: {
-          priority: 'HIGH',
+          priority: urgent ? 'HIGH' : 'NORMAL',
           ttl: '600s',
           collapse_key: 'wake'
         }
@@ -1311,6 +1447,7 @@ app.get('/api/user/:hash', async (req, reply) => {
     delete user.avatar_updated_at
   }
   delete user.email_block
+  const uaHash = user.ua_hash
   delete user.ua_hash
   if (!isOwner || !user.profile_key_wrap) delete user.profile_key_wrap
 
@@ -1322,11 +1459,13 @@ app.get('/api/user/:hash', async (req, reply) => {
   user.call_e2e = user.call_e2e === true
 
   const blockedByOwner = payload ? await isBlockedBy(hash, payload.sub) : false
+  const contact = isOwner || accessKeyMatches(uaHash, String(req.headers['x-access-key'] || '')) ||
+    await sharesGroup(payload.sub, hash)
 
-  if (user.activity_hidden === true || !payload || blockedByOwner || stranger) {
+  if (user.activity_hidden === true || !payload || blockedByOwner || stranger || !contact) {
     user.last_heartbeat_ms = 0
     user.last_seen_ms = 0
-    if (blockedByOwner || !payload || stranger) user.is_online = false
+    if (blockedByOwner || !payload || stranger || !contact) user.is_online = false
   }
   delete user.activity_hidden
 
@@ -1457,8 +1596,8 @@ app.post('/api/user/change-email', async (req, reply) => {
     await client.query('UPDATE conversation_meta SET user_hash=$1 WHERE user_hash=$2', [newHash, oldHash])
     await client.query('UPDATE messages SET sender_hash=$1 WHERE sender_hash=$2', [newHash, oldHash])
     await client.query('UPDATE messages SET recipient_hash=$1 WHERE recipient_hash=$2', [newHash, oldHash])
-    await client.query('UPDATE blocked_users SET blocker_hash=$1 WHERE blocker_hash=$2', [newHash, oldHash])
-    await client.query('UPDATE blocked_users SET blocked_hash=$1 WHERE blocked_hash=$2', [newHash, oldHash])
+    await client.query('UPDATE blocked_users SET blocker_hash=$1 WHERE blocker_hash=$2', [bt(newHash), bt(oldHash)])
+    await client.query('UPDATE blocked_users SET blocked_hash=$1 WHERE blocked_hash=$2', [bt(newHash), bt(oldHash)])
     await client.query('UPDATE groups SET created_by=$1 WHERE created_by=$2', [newHash, oldHash])
     await client.query('SAVEPOINT bans')
     try { await client.query('UPDATE group_bans SET user_hash=$1 WHERE user_hash=$2', [newHash, oldHash]) }
@@ -1562,7 +1701,7 @@ async function deleteUserData(hash) {
     await client.query('DELETE FROM messages WHERE sender_hash=$1 OR recipient_hash=$1', [hash])
     await client.query('DELETE FROM conversation_meta WHERE user_hash=$1', [hash])
     await client.query('DELETE FROM conversation_participants WHERE user_hash=$1', [hash])
-    await client.query('DELETE FROM blocked_users WHERE blocker_hash=$1 OR blocked_hash=$1', [hash])
+    await client.query('DELETE FROM blocked_users WHERE blocker_hash=$1 OR blocked_hash=$1', [bt(hash)])
     await client.query('SAVEPOINT owner')
     try {
       await client.query('UPDATE groups SET created_by=NULL WHERE created_by=$1', [hash])
@@ -1719,6 +1858,7 @@ setInterval(purgeOldInvites, 60 * 60 * 1000)
 
 const REPORTS_ADMIN_KEY = process.env.REPORTS_ADMIN_KEY || null
 const REPORT_TOPICS   = new Set(['bug', 'feature', 'other'])
+const REPORT_PLATFORMS = new Set(['SinusChatA', 'SinusChat-Desktop', 'SinusChatI'])
 const REPORT_STATUSES = new Set(['pending', 'confirmed', 'rejected'])
 const REPORT_MAX_PER_DAY = 10
 const REPORT_RETENTION_DAYS = 30
@@ -1765,6 +1905,7 @@ app.post('/api/report', { config: { rateLimit: { max: 6, timeWindow: '1 hour' } 
   const description = clip(b.description, 4000)
   const email = clip(b.email, 254)
   const topic = REPORT_TOPICS.has(b.topic) ? b.topic : 'other'
+  const platform = REPORT_PLATFORMS.has(b.platform) ? b.platform : 'SinusChatA'
   if (!description || description.length < 10) {
     return reply.code(400).send({ error: 'Opis jest za krótki', code: 'description_too_short' })
   }
@@ -1782,11 +1923,11 @@ app.post('/api/report', { config: { rateLimit: { max: 6, timeWindow: '1 hour' } 
   const now = Date.now()
   const { rows } = await db.query(
     `INSERT INTO bug_reports (user_hash, email, name, topic, description, app_version, device, android,
-                              diagnostics, status, created_at, updated_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,$10) RETURNING id`,
+                              diagnostics, status, created_at, updated_at, platform)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',$10,$10,$11) RETURNING id`,
     [payload.sub, email, clip(b.name, 100), topic, description, clip(b.appVersion, 40),
-     clip(b.device, 120), clip(b.android, 20), clip(b.diagnostics, 16000), now])
-  console.log('[REPORT] nowe zgłoszenie #' + rows[0].id + ' (' + topic + ')')
+     clip(b.device, 120), clip(b.android, 20), clip(b.diagnostics, 16000), now, platform])
+  console.log('[REPORT] nowe zgłoszenie #' + rows[0].id + ' (' + topic + ', ' + platform + ')')
   return { ok: true, id: Number(rows[0].id) }
 })
 
@@ -1796,12 +1937,13 @@ app.get('/api/reports/mine', async (req, reply) => {
   if (!payload) return reply.code(401).send({ error: 'Brak autoryzacji' })
   if (payload.kicked) return reply.code(409).send({ error: 'device_kicked', kicked: true })
   const { rows } = await db.query(
-    `SELECT id, topic, description, status, reply, replied_at, created_at, (email IS NOT NULL) AS has_email,
+    `SELECT id, topic, description, status, reply, replied_at, created_at, (email IS NOT NULL) AS has_email, platform,
             ${REPORT_RETENTION_BASE_SQL} AS retention_base
        FROM bug_reports WHERE user_hash=$1 ORDER BY created_at DESC LIMIT 50`, [payload.sub])
   return {
     reports: rows.map(r => ({
       id: Number(r.id), topic: r.topic, status: r.status,
+      platform: r.platform || 'SinusChatA',
       description: String(r.description || '').slice(0, 300),
       reply: r.reply || null,
       hasEmail: r.has_email === true,
@@ -1825,7 +1967,7 @@ app.get('/api/reports-admin/list', { config: { rateLimit: { max: 60, timeWindow:
     where.push(`(description ILIKE $${params.length} ESCAPE '\\' OR email ILIKE $${params.length} ESCAPE '\\' OR device ILIKE $${params.length} ESCAPE '\\')`)
   }
   const { rows } = await db.query(
-    `SELECT id, email, name, topic, description, app_version, device, android, diagnostics,
+    `SELECT id, email, name, topic, description, app_version, device, android, diagnostics, platform,
             status, reply, replied_at, created_at, updated_at, decided_at,
             ${REPORT_RETENTION_BASE_SQL} AS retention_base
        FROM bug_reports ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
@@ -1839,6 +1981,7 @@ app.get('/api/reports-admin/list', { config: { rateLimit: { max: 60, timeWindow:
     reports: rows.map(r => ({
       id: Number(r.id), email: r.email, name: r.name, topic: r.topic, description: r.description,
       appVersion: r.app_version, device: r.device, android: r.android, diagnostics: r.diagnostics,
+      platform: r.platform || 'SinusChatA',
       status: r.status, reply: r.reply,
       repliedAt: r.replied_at ? Number(r.replied_at) : null,
       createdAt: Number(r.created_at), updatedAt: r.updated_at ? Number(r.updated_at) : null,
@@ -1907,8 +2050,16 @@ app.post('/api/reports-admin/:id', { config: { rateLimit: { max: 60, timeWindow:
 })
 
 
+const REPORT_PERSONAL_KEEP_MS = 24 * 60 * 60 * 1000
+
 async function purgeOldReports() {
   try {
+    await db.query(
+      `UPDATE bug_reports SET email=NULL, name=NULL, device=NULL, android=NULL, app_version=NULL, diagnostics=NULL
+        WHERE status IN ('confirmed', 'rejected') AND decided_at IS NOT NULL AND decided_at < $1
+          AND (email IS NOT NULL OR name IS NOT NULL OR device IS NOT NULL OR android IS NOT NULL
+               OR app_version IS NOT NULL OR diagnostics IS NOT NULL)`,
+      [Date.now() - REPORT_PERSONAL_KEEP_MS])
     const { rowCount } = await db.query(
       `DELETE FROM bug_reports WHERE ${REPORT_RETENTION_BASE_SQL} < $1`,
       [Date.now() - REPORT_RETENTION_MS])
@@ -2138,9 +2289,10 @@ app.post('/api/user/block', async (req, reply) => {
   const { blockedHash, block } = req.body || {}
   if (!blockedHash) return reply.code(400).send({ error: 'Brak blockedHash' })
   if (block) {
-    await db.query('INSERT INTO blocked_users(blocker_hash,blocked_hash) VALUES($1,$2) ON CONFLICT DO NOTHING', [payload.sub, blockedHash])
+    await db.query('INSERT INTO blocked_users(blocker_hash,blocked_hash,blocked_at) VALUES($1,$2,NULL) ON CONFLICT DO NOTHING',
+      [bt(payload.sub), bt(blockedHash)])
   } else {
-    await db.query('DELETE FROM blocked_users WHERE blocker_hash=$1 AND blocked_hash=$2', [payload.sub, blockedHash])
+    await db.query('DELETE FROM blocked_users WHERE blocker_hash=$1 AND blocked_hash=$2', [bt(payload.sub), bt(blockedHash)])
     sendToUser(blockedHash, { type: 'unblocked', by: payload.sub })
   }
   return { ok: true, blocked: !!block }
@@ -2154,7 +2306,7 @@ app.post('/api/user/unblock', async (req, reply) => {
 
   const hash = req.body?.unblockedHash || req.body?.blockedHash
   if (!hash) return reply.code(400).send({ error: 'Brak hasha' })
-  await db.query('DELETE FROM blocked_users WHERE blocker_hash=$1 AND blocked_hash=$2', [payload.sub, hash])
+  await db.query('DELETE FROM blocked_users WHERE blocker_hash=$1 AND blocked_hash=$2', [bt(payload.sub), bt(hash)])
   sendToUser(hash, { type: 'unblocked', by: payload.sub })
   return { ok: true, blocked: false }
 })
@@ -2252,11 +2404,15 @@ app.post('/api/presence', { config: { rateLimit: { max: 60, timeWindow: '1 minut
   const list = Array.isArray(req.body?.hashes) ? req.body.hashes.slice(0, 200) : []
   const hashes = [...new Set(list.map(String).filter(h => /^[a-f0-9]{64}$/.test(h)))]
   if (!hashes.length) return {}
+  const keys = req.body?.keys && typeof req.body.keys === 'object' ? req.body.keys : null
+  const legacy = !keys && Date.now() < PRESENCE_LEGACY_UNTIL
   const { rows } = await db.query(
-    'SELECT email_hash, activity_hidden, email_block, block_new FROM users WHERE email_hash = ANY($1::varchar[])', [hashes])
+    'SELECT email_hash, activity_hidden, email_block, block_new, ua_hash FROM users WHERE email_hash = ANY($1::varchar[])', [hashes])
+  const groupPeers = legacy ? null : await groupPeersOf(payload.sub, hashes)
   const out = {}
   for (const r of rows) {
     if (r.activity_hidden === true) continue
+    if (!legacy && !accessKeyMatches(r.ua_hash, keys?.[r.email_hash]) && !groupPeers.has(r.email_hash)) continue
     if ((r.email_block === true || r.block_new === true) &&
         !lookupAllowed('h', payload.sub, r.email_hash, HIDDEN_LOOKUP_LIMIT)) continue
     if (await isBlockedBy(r.email_hash, payload.sub)) continue
@@ -2276,6 +2432,39 @@ app.get('/api/messages/waiting', async (req, reply) => {
   return { count: rows[0]?.n || 0 }
 })
 
+const PENDING_LEASE_MS = 60_000
+const pendingLeases = new Map()
+setInterval(async () => {
+  const cutoff = Date.now() - PENDING_LEASE_MS
+  for (const [user, lease] of pendingLeases) {
+    const stale = []
+    for (const [id, at] of lease) if (at < cutoff) { stale.push(id); lease.delete(id) }
+    if (!lease.size) pendingLeases.delete(user)
+    if (!stale.length) continue
+    console.warn(`[DELIVERY] niepotwierdzone pobranie, ${stale.length} wiadomości wraca do kolejki`)
+    await db.query('UPDATE messages SET delivered_at=NULL WHERE recipient_hash=$1 AND id = ANY($2::varchar[])', [user, stale]).catch(() => {})
+  }
+}, 10_000)
+
+app.post('/api/messages/received', async (req, reply) => {
+  const payload = await verifyActiveDevice(req.headers.authorization?.replace('Bearer ', ''))
+  if (!payload) return reply.code(401).send({ error: 'Brak autoryzacji' })
+  if (payload.kicked) return reply.code(409).send({ error: 'device_kicked', kicked: true })
+  const ids = Array.isArray(req.body?.ids)
+    ? req.body.ids.filter(x => typeof x === 'string' && x.length <= 110).slice(0, 500) : []
+  const lease = pendingLeases.get(payload.sub)
+  if (lease) {
+    for (const id of ids) lease.delete(id)
+    if (!lease.size) pendingLeases.delete(payload.sub)
+  }
+  if (ids.length) {
+    await db.query(
+      "DELETE FROM messages WHERE recipient_hash=$1 AND id = ANY($2::varchar[]) AND delivered_at IS NOT NULL AND left(conversation_id, 2) <> 'g_'",
+      [payload.sub, ids]).catch(() => {})
+  }
+  return { ok: true }
+})
+
 app.get('/api/messages/pending', async (req, reply) => {
   const auth = req.headers.authorization?.replace('Bearer ', '')
   const payload = await verifyActiveDevice(auth)
@@ -2293,10 +2482,16 @@ app.get('/api/messages/pending', async (req, reply) => {
   if (!rows.length) return []
 
   const ids = rows.map(r => r.id)
+  const leasedAt = Date.now()
   await db.query(
     'UPDATE messages SET delivered_at=$1 WHERE id = ANY($2::varchar[])',
-    [Date.now(), ids]
+    [leasedAt, ids]
   )
+  if (req.query?.confirm === '1') {
+    let lease = pendingLeases.get(payload.sub)
+    if (!lease) pendingLeases.set(payload.sub, lease = new Map())
+    for (const id of ids) lease.set(id, leasedAt)
+  }
 
   return rows.map(r => ({
     id: r.id,
@@ -2379,18 +2574,22 @@ app.post('/api/message', async (req, reply) => {
       [conversationId, payload.sub]
     )
     recipients = members.map(m => m.user_hash)
+    const only = Array.isArray(req.body?.only)
+      ? new Set(req.body.only.slice(0, 500).map(String).filter(h => /^[a-f0-9]{64}$/.test(h))) : null
+    if (only) recipients = recipients.filter(h => only.has(h))
   } else {
     if (!recipientHash) return reply.code(400).send({ error: 'Brak recipientHash' })
     recipients = [recipientHash]
   }
 
   if (isGroup && recipients.length) {
+    const byTag = new Map(recipients.map(h => [bt(h), h]))
     const { rows: blockers } = await db.query(
       'SELECT blocker_hash FROM blocked_users WHERE blocked_hash=$1 AND blocker_hash = ANY($2::text[])',
-      [payload.sub, recipients]
+      [bt(payload.sub), [...byTag.keys()]]
     ).catch(() => ({ rows: [] }))
     if (blockers.length) {
-      const skip = new Set(blockers.map(r => r.blocker_hash))
+      const skip = new Set(blockers.map(r => byTag.get(r.blocker_hash)))
       recipients = recipients.filter(h => !skip.has(h))
     }
   }
@@ -2410,17 +2609,13 @@ app.post('/api/message', async (req, reply) => {
       [rowId, conversationId, payload.sub, rHash, kind || 'msg', msgBytes, now]
     )
 
-    const live = sendToUser(rHash, {
+    const live = await deliverRow(rHash, rowId, {
       type: 'message', conversationId, id: msgId, kind: kind || 'msg',
       payloadB64, senderHash: payload.sub, createdAt: now
-    })
+    }, kind || 'msg', now)
 
-    if (live) {
-      deliveredAny = true
-      await db.query('UPDATE messages SET delivered_at=$1 WHERE id=$2', [now, rowId])
-    } else {
-      wakeUser(rHash, kind || 'msg').catch(() => {})
-    }
+    if (live) deliveredAny = true
+    else wakeUser(rHash, kind || 'msg').catch(() => {})
   }
 
   return { ok: true, messageId: msgId, deliveredLive: deliveredAny, createdAt: now }
@@ -2476,9 +2671,8 @@ app.post('/api/sealed', { config: { rateLimit: { max: 240, timeWindow: '1 minute
     [rowId, to, Buffer.from(payloadB64, 'base64'), now])
   if (!ins.rowCount) return { ok: true, messageId: id, createdAt: now }
 
-  const live = sendToUser(to, { type: 'message', kind: 'sealed', id: rowId, payloadB64, createdAt: now })
-  if (live) await db.query('UPDATE messages SET delivered_at=$1 WHERE id=$2', [now, rowId])
-  else wakeUser(to, 'msg').catch(() => {})
+  const live = await deliverRow(to, rowId, { type: 'message', kind: 'sealed', id: rowId, payloadB64, createdAt: now }, 'msg', now)
+  if (!live) wakeUser(to, 'msg').catch(() => {})
   return { ok: true, messageId: id, deliveredLive: !!live, createdAt: now }
 })
 
@@ -2511,7 +2705,7 @@ app.post('/api/ack', async (req, reply) => {
   let groupAuthors = []
   if (deliveredUpTo) {
     const del = await db.query(
-      'DELETE FROM messages WHERE recipient_hash=$1 AND conversation_id=$2 AND created_at <= $3::bigint RETURNING sender_hash',
+      'DELETE FROM messages WHERE recipient_hash=$1 AND conversation_id=$2 AND created_at <= $3::bigint AND delivered_at IS NOT NULL RETURNING sender_hash',
       [payload.sub, conversationId, deliveredUpTo]
     ).catch(() => null)
     if (isGroup && del) groupAuthors = [...new Set(del.rows.map(r => r.sender_hash).filter(h => h && h !== payload.sub))]
@@ -2909,6 +3103,7 @@ app.get('/api/groups/:groupId', async (req, reply) => {
     [groupId]
   )
   if (!members.find(m => m.user_hash === payload.sub)) return reply.code(403).send({ error: 'Nie jesteś członkiem' })
+  touchGroupDay(groupId)
   const signalSet = await signalCapable(members.map(m => m.user_hash))
   for (const m of members) m.signal = signalSet.has(m.user_hash)
   const now = Date.now()
@@ -3237,6 +3432,7 @@ app.register(async function (app) {
       return
     }
     wsConnByIp.set(ip, cur + 1)
+    socket.openedAt = Date.now()
 
     let userHash = null
     let msgCount = 0
@@ -3272,10 +3468,19 @@ app.register(async function (app) {
         } catch (_) {}
         socket.deviceId = payload.deviceId || null
 
+        socket.userHash = userHash
         const prev = connections.get(userHash)
-        if (prev && prev !== socket && prev.readyState === 1) {
-          try { prev.send(JSON.stringify({ type: 'device_kicked' })) } catch (_) {}
-          try { prev.close() } catch (_) {}
+        if (prev && prev !== socket) await failProbes(prev, false)
+        if (socket.readyState !== 1) return
+        const holder = connections.get(userHash)
+        if (holder && holder !== socket && holder.readyState === 1) {
+          const sameDevice = !!socket.deviceId && holder.deviceId === socket.deviceId
+          if (sameDevice && (holder.openedAt || 0) > socket.openedAt) {
+            try { socket.close(1000, 'superseded') } catch (_) {}
+            return
+          }
+          if (!sameDevice) try { holder.send(JSON.stringify({ type: 'device_kicked' })) } catch (_) {}
+          try { holder.close() } catch (_) {}
         }
 
         connections.set(userHash, socket)
@@ -3284,7 +3489,7 @@ app.register(async function (app) {
         if (Array.isArray(msg.caps) && msg.caps.includes('call_e2e')) {
           db.query('UPDATE users SET call_e2e=true WHERE email_hash=$1 AND call_e2e IS NOT TRUE', [userHash]).catch(() => {})
         }
-        socket.send(JSON.stringify({ type: 'auth_ok', hash: userHash, userHash }))
+        socket.send(JSON.stringify({ type: 'auth_ok', hash: userHash, userHash, boot: SERVER_BOOT, caps: SERVER_CAPS }))
         loadNtfyTopic(userHash)
 
         gcallSendActive(userHash).catch(() => {})
@@ -3518,10 +3723,11 @@ app.register(async function (app) {
 
     socket.on('message', onMessage)
     socket.heartbeatAlive = true
-    socket.on('pong', () => { socket.heartbeatAlive = true })
+    socket.on('pong', (data) => onWsPong(socket, data))
     allSockets.add(socket)
     socket.on('close', () => {
       allSockets.delete(socket)
+      failProbes(socket, true)
       if (userHash && connections.get(userHash) === socket) connections.delete(userHash)
       const n = (wsConnByIp.get(ip) || 1) - 1
       if (n <= 0) wsConnByIp.delete(ip); else wsConnByIp.set(ip, n)
@@ -3538,11 +3744,6 @@ setInterval(async () => {
     )
     if (rowCount > 0) console.log('[cleanup] Usunięto', rowCount, 'nieodebranych wiadomości')
 
-    await db.query(
-      'DELETE FROM messages WHERE delivered_at IS NOT NULL AND delivered_at < $1::bigint',
-      [Date.now() - 60 * 60 * 1000]
-    )
-
     const groupCutoffDay = Math.floor(Date.now() / 86400000) - 548
     await db.query(`
       DELETE FROM conversation_participants cp
@@ -3551,8 +3752,14 @@ setInterval(async () => {
         AND g.last_active_day IS NOT NULL
         AND g.last_active_day < $1::integer
     `, [groupCutoffDay])
-  } catch(e) { console.error('[cleanup]', e.message) }
+  } catch(e) { console.error('[cleanup]', scrubLog(e.message)) }
 }, 60 * 60 * 1000)
+
+const DELIVERED_KEEP_MS = 5 * 60 * 1000
+setInterval(() => {
+  db.query('DELETE FROM messages WHERE delivered_at IS NOT NULL AND delivered_at < $1::bigint',
+    [Date.now() - DELIVERED_KEEP_MS]).catch(() => {})
+}, DELIVERED_KEEP_MS).unref?.()
 
 setInterval(() => {
   const freeGB = getFreeDiskGB()
