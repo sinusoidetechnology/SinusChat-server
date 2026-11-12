@@ -423,6 +423,9 @@ const MESSAGE_TTL_MS = 24 * 60 * 60 * 1000
 
 const NOTIFIABLE_KINDS = new Set(['msg', 'group_attach'])
 const URGENT_WAKE_KINDS = new Set(['msg', 'group_attach', 'sealed', 'call', 'kicked', 'expiry_notice'])
+const QUIET_SEALED = 'sealed_q'
+const FCM_WAKE_TTL = Math.round(MESSAGE_TTL_MS / 1000) + 's'
+const FCM_CALL_TTL = '120s'
 
 function baseMessageId(rowId) {
   return String(rowId).replace(/_[0-9a-f]{16}$/, '')
@@ -913,17 +916,18 @@ async function sendFcm(userHash, fcmToken, kind) {
   try {
     const access = await fcmGetAccessToken()
     if (!access) return false
-    const urgent = URGENT_WAKE_KINDS.has(kind || 'msg')
+    const k = kind || 'msg'
+    const urgent = URGENT_WAKE_KINDS.has(k)
     const res = await fetch(`https://fcm.googleapis.com/v1/projects/${acc.project_id}/messages:send`, {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${access}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ message: {
         token: fcmToken,
-        data: { w: '1' },
+        data: { w: urgent ? '1' : '0' },
         android: {
           priority: urgent ? 'HIGH' : 'NORMAL',
-          ttl: '600s',
-          collapse_key: 'wake'
+          ttl: k === 'call' ? FCM_CALL_TTL : FCM_WAKE_TTL,
+          collapse_key: k === 'call' ? 'call' : urgent ? 'wake' : 'quiet'
         }
       } })
     })
@@ -2497,7 +2501,7 @@ app.get('/api/messages/pending', async (req, reply) => {
     id: r.id,
     conversationId: r.conversation_id,
     senderHash: r.sender_hash,
-    kind: r.kind,
+    kind: r.kind === QUIET_SEALED ? 'sealed' : r.kind,
     payloadB64: r.payload.toString('base64'),
     createdAt: r.created_at
   }))
@@ -2665,14 +2669,16 @@ app.post('/api/sealed', { config: { rateLimit: { max: 240, timeWindow: '1 minute
     return { ok: true, createdAt: now }
   }
   const rowId = 's_' + id
+  const quiet = req.body?.urgent === false
+  const wakeKind = quiet ? 'quiet' : 'msg'
   const ins = await db.query(
     `INSERT INTO messages(id,conversation_id,sender_hash,recipient_hash,kind,payload,created_at)
-     VALUES($1,'',NULL,$2,'sealed',$3,$4) ON CONFLICT(id) DO NOTHING`,
-    [rowId, to, Buffer.from(payloadB64, 'base64'), now])
+     VALUES($1,'',NULL,$2,$5,$3,$4) ON CONFLICT(id) DO NOTHING`,
+    [rowId, to, Buffer.from(payloadB64, 'base64'), now, quiet ? QUIET_SEALED : 'sealed'])
   if (!ins.rowCount) return { ok: true, messageId: id, createdAt: now }
 
-  const live = await deliverRow(to, rowId, { type: 'message', kind: 'sealed', id: rowId, payloadB64, createdAt: now }, 'msg', now)
-  if (!live) wakeUser(to, 'msg').catch(() => {})
+  const live = await deliverRow(to, rowId, { type: 'message', kind: 'sealed', id: rowId, payloadB64, createdAt: now }, wakeKind, now)
+  if (!live) wakeUser(to, wakeKind).catch(() => {})
   return { ok: true, messageId: id, deliveredLive: !!live, createdAt: now }
 })
 
@@ -2684,7 +2690,7 @@ app.post('/api/sealed/ack', async (req, reply) => {
     ? req.body.ids.filter(x => typeof x === 'string' && x.length <= 110).slice(0, 500) : []
   if (!ids.length) return { ok: true, deleted: 0 }
   const r = await db.query(
-    "DELETE FROM messages WHERE recipient_hash=$1 AND kind='sealed' AND id = ANY($2::varchar[])",
+    "DELETE FROM messages WHERE recipient_hash=$1 AND kind IN ('sealed','sealed_q') AND id = ANY($2::varchar[])",
     [payload.sub, ids])
   return { ok: true, deleted: r.rowCount }
 })
