@@ -12,3 +12,4 @@ client_secret*.json
 *.p12
 *.sql.gz
 dump*.sql
+db_data/

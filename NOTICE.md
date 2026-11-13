@@ -4,7 +4,7 @@ Copyright © 2026 Sinusoide Technology
 
 ## Polski
 
-Serwer SinusChat (`server.js`) jest udostępniany na licencji **GNU Affero General Public License w wersji 3** (AGPL-3.0) — pełny tekst w pliku [LICENSE](LICENSE) — z warunkami dodatkowymi z sekcji 7, takimi samymi jak dla aplikacji SinusChat:
+Serwer SinusChat (`server.js` i katalog `src/`) jest udostępniany na licencji **GNU Affero General Public License w wersji 3** (AGPL-3.0) — pełny tekst w pliku [LICENSE](LICENSE) — z warunkami dodatkowymi z sekcji 7, takimi samymi jak dla aplikacji SinusChat:
 
 - **Nazwy i znaki (7 e).** Licencja nie daje praw do nazw „SinusChat", „Sinia", „Sinusoide" ani do logo i ikon. Zmieniona wersja musi mieć własną nazwę.
 - **Oznaczenie zmienionej wersji (7 c).** Zmieniona wersja musi być wyraźnie opisana jako zmieniona i niepochodząca od Sinusoide Technology. Nie wolno przedstawiać jej jako oficjalnego serwera SinusChat.
@@ -19,7 +19,7 @@ Pełny opis licencji (także zasady zgłaszania błędów): [sinusoide.pl/dokume
 
 ## English
 
-The SinusChat server (`server.js`) is licensed under the **GNU Affero General Public License version 3** (AGPL-3.0) — full text in [LICENSE](LICENSE) — with the same additional terms under section 7 as the SinusChat app:
+The SinusChat server (`server.js` and the `src/` directory) is licensed under the **GNU Affero General Public License version 3** (AGPL-3.0) — full text in [LICENSE](LICENSE) — with the same additional terms under section 7 as the SinusChat app:
 
 - **Names and marks (7 e).** No rights are granted to the names „SinusChat", „Sinia", „Sinusoide" or to the logo and icons. A modified version must have its own name.
 - **Marking modified versions (7 c).** A modified version must be clearly described as modified and not coming from Sinusoide Technology. It may not be presented as the official SinusChat server.

@@ -1,0 +1,68 @@
+name: sinuschat
+
+x-common: &common
+
+services:
+  server:
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    build: .
+    image: sinuschat-server:${SINUSCHAT_IMAGE_TAG:-latest}
+    container_name: sinuschat-server
+    user: "${SINUSCHAT_UID:-1000}:${SINUSCHAT_GID:-1000}"
+    read_only: true
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: "3000"
+    ports:
+      - "127.0.0.1:${PORT:-3000}:3000"
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    ulimits:
+      nofile: 65536
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - default
+      - db
+
+  postgres:
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    image: postgres:18-alpine
+    container_name: sinuschat-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-sinuschat}
+      POSTGRES_DB: ${POSTGRES_DB:-sinuschat}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Brak hasla POSTGRES_PASSWORD w .env}
+    volumes:
+      - ./db_data:/var/lib/postgresql
+      - ./schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+    shm_size: 128m
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - db
+
+networks:
+  db:
+    internal: true
