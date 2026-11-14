@@ -5,7 +5,7 @@
 const { Readable } = require("stream");
 
 const { sameHex, sha256Hex, uploadHmacHex } = require("../crypto");
-const { clientIp } = require("../common");
+const { clientIp, perMinute } = require("../common");
 const { scrubLog } = require("../log");
 const { requireAuth } = require("./auth");
 
@@ -28,6 +28,7 @@ const FILES_RELAY_MAX = 52 * 1024 * 1024;
 // więc tylko odciąć nadużycia, a nie zwykłe równoległe pobieranie (aplikacja nie ponawia po 503).
 const FILES_RELAY_SLOTS = 64;
 const FILES_RELAY_SLOTS_PER_IP = 16;
+const FILES_RELAY_PER_MINUTE = 1200;
 const FILES_RELAY_HEADERS = ["content-type", "accept", "x-file-id", "x-upload-token", "x-account", "x-file-auth"];
 const FILES_RELAY_REPLY_HEADERS = ["content-type", "content-disposition", "cache-control", "etag", "last-modified"];
 const RELAY_CACHEABLE_MAX = RELAY_CACHE_MAX / 4;
@@ -195,6 +196,7 @@ async function filesRelayRoutes(relay) {
     method: ["GET", "POST"],
     url: "/api/files/*",
     bodyLimit: FILES_RELAY_MAX,
+    config: perMinute(FILES_RELAY_PER_MINUTE),
     onRequest: holdRelaySlot,
     handler: relayToFilesServer,
   });

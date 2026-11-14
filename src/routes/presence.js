@@ -14,6 +14,7 @@ const {
   lookupAllowed,
   perMinute,
   sendToAll,
+  strangerLookupAllowed,
   withoutBlockers,
 } = require("../common");
 const { requireAuth } = require("./auth");
@@ -143,12 +144,15 @@ function presenceRoutes(app) {
         myHash,
       ),
     );
-    const groupPeers = legacy ? null : await groupPeersOf(myHash, hashes);
+    const groupPeers = await groupPeersOf(myHash, hashes);
+    const found = new Map(rows.map((r) => [r.email_hash, r]));
     const result = {};
-    for (const { email_hash: hash, activity_hidden, email_block, block_new, ua_hash: uaHash } of rows) {
-      if (activity_hidden === true || !visible.has(hash)) continue;
-      if (!legacy && !accessKeyMatches(uaHash, keys?.[hash]) && !groupPeers.has(hash)) continue;
-      if ((email_block === true || block_new === true) && !lookupAllowed("h", myHash, hash, HIDDEN_LOOKUP_LIMIT)) continue;
+    for (const hash of hashes) {
+      const row = found.get(hash);
+      const proven = !!row && (accessKeyMatches(row.ua_hash, keys?.[hash]) || groupPeers.has(hash));
+      if (!proven && (!legacy || !strangerLookupAllowed(myHash, hash))) continue;
+      if (!row || row.activity_hidden === true || !visible.has(hash)) continue;
+      if ((row.email_block === true || row.block_new === true) && !lookupAllowed("h", myHash, hash, HIDDEN_LOOKUP_LIMIT)) continue;
       result[hash] = { online: isOnlineNow(hash), seen: presenceOf(hash).seen || 0 };
     }
     return result;

@@ -21,6 +21,7 @@ const {
   searchAllowed,
   sendToUser,
   sharesGroup,
+  strangerLookupAllowed,
 } = require("../common");
 const { scrubLog } = require("../log");
 const {
@@ -424,8 +425,15 @@ function userRoutes(app) {
     if (viewer?.kicked) viewer = null;
     const proofKind = viewer ? null : authProofKind(req.headers["x-auth-proof"], hash);
     if (!viewer && !proofKind) return reply.code(401).send({ error: "Brak autoryzacji" });
+    if (!isHash(hash)) return reply.code(404).send(NOT_FOUND);
 
     const { rows } = await db.query(`SELECT ${PROFILE_COLUMNS} FROM users WHERE email_hash=$1`, [hash]);
+    const accessKey = String(req.headers["x-access-key"] || "");
+    const isOwner = !viewer || viewer.sub === hash;
+    const contact = isOwner || (rows.length > 0 && (accessKeyMatches(rows[0].ua_hash, accessKey) || (await sharesGroup(viewer.sub, hash))));
+    if (!contact && !strangerLookupAllowed(viewer.sub, hash)) {
+      return reply.code(429).send({ error: "Za dużo wyszukiwań — spróbuj później" });
+    }
     if (!rows.length) return reply.code(404).send(NOT_FOUND);
     const [user] = rows;
     const accountKind = user.account_kind || "email";
@@ -435,8 +443,6 @@ function userRoutes(app) {
     const isSearch = String(req.headers["x-search"]) === "true";
     if (isSearch && (user.email_block === true || accountKind === "anon")) return reply.code(404).send(NOT_FOUND);
 
-    const accessKey = String(req.headers["x-access-key"] || "");
-    const isOwner = !viewer || viewer.sub === hash;
     if (user.block_new === true && !isOwner && !(await knownContact({ uaHash: user.ua_hash }, hash, viewer.sub, accessKey))) {
       return reply.code(404).send(NOT_FOUND);
     }
@@ -453,7 +459,6 @@ function userRoutes(app) {
     const activityHidden = user.activity_hidden === true;
     const blockedByOwner = viewer ? await isBlockedBy(hash, viewer.sub) : false;
     // Obecność widzi tylko właściciel, ktoś z kluczem dostępu albo ze wspólnej grupy.
-    const contact = isOwner || accessKeyMatches(user.ua_hash, accessKey) || (await sharesGroup(viewer.sub, hash));
     const hidePresence = activityHidden || !viewer || blockedByOwner || stranger || !contact;
     const activity = presenceOf(hash);
 

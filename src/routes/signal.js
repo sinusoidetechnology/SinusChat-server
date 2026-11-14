@@ -14,8 +14,10 @@ const {
   perHour,
   perMinute,
   sendToAll,
+  sharesGroup,
   signedKeyOk,
   spendBudget,
+  strangerLookupAllowed,
 } = require("../common");
 const { requireAuth } = require("./auth");
 
@@ -140,6 +142,9 @@ function signalRoutes(app) {
     const hash = String(req.params.hash || "");
     if (!isHash(hash) || hash === myHash) return reply.code(404).send({ error: "Brak kluczy" });
     if (await isBlockedBy(hash, myHash)) return reply.code(404).send({ error: "Brak kluczy" });
+    if (!(await sharesGroup(myHash, hash)) && !strangerLookupAllowed(myHash, hash)) {
+      return reply.code(429).send({ error: "Za dużo wyszukiwań — spróbuj później" });
+    }
     try {
       const { rows } = await db.query(
         `SELECT sk.*, u.email_block AS u_email_block, u.block_new AS u_block_new

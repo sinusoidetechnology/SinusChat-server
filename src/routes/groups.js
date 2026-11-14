@@ -10,6 +10,7 @@ const {
   isBlockedBy,
   isGroupBanned,
   isHash,
+  isKnownContact,
   isParticipant,
   knownContact,
   memberCount,
@@ -21,6 +22,7 @@ const {
   perMinute,
   sendToAll,
   sendToUser,
+  strangerLookupAllowed,
   userExists,
   withoutBlockers,
 } = require("../common");
@@ -31,6 +33,7 @@ const { signalCapable } = require("./signal");
 
 const GROUP_INVITE_RE = /^grp_[A-Za-z0-9_-]{20,40}$/;
 const MAX_GROUP_MEMBERS = 1000;
+const GROUPS_CREATED_HOURLY = 30;
 const MAX_GROUP_NAME_CHARS = 1024;
 const MAX_GROUP_DESCRIPTION_CHARS = 8192;
 const GROUP_PERM_KEYS = ["editSettings", "sendMessages", "addMembers", "callGroup"];
@@ -123,11 +126,17 @@ async function invitableMembers(members, myHash, accessKeys) {
        FROM users u WHERE u.email_hash = ANY($1::varchar[])`,
     [hashes, myHash],
   );
-  return rows.filter((r) => r.block_new !== true || r.shares_group || accessKeyMatches(r.ua_hash, accessKeys[r.email_hash])).map((r) => r.email_hash);
+  const found = new Map(rows.map((r) => [r.email_hash, r]));
+  return hashes.filter((hash) => {
+    const row = found.get(hash);
+    if (row && (row.shares_group || accessKeyMatches(row.ua_hash, accessKeys[hash]))) return true;
+    if (!strangerLookupAllowed(myHash, hash)) return false;
+    return !!row && row.block_new !== true;
+  });
 }
 
 function groupRoutes(app) {
-  app.post("/api/groups/create", { preHandler: requireAuth }, async (req, reply) => {
+  app.post("/api/groups/create", { preHandler: requireAuth, config: perHour(GROUPS_CREATED_HOURLY) }, async (req, reply) => {
     const myHash = req.auth.sub;
     const { name, description, members, avatarColor, avatarUrl, aks } = req.body || {};
     if (!name || !Array.isArray(members) || !members.length) {
@@ -218,6 +227,9 @@ function groupRoutes(app) {
       return reply.code(403).send({ error: "Nie możesz dodawać członków", code: "group_add_forbidden" });
     }
 
+    if (!(await isKnownContact(myHash, userHash, ak)) && !strangerLookupAllowed(myHash, userHash)) {
+      return reply.code(429).send({ error: "Za dużo nowych osób — spróbuj jutro", code: "too_many_lookups" });
+    }
     if (!(await userExists(userHash))) {
       return reply.code(403).send({ error: "Nie można dodać tej osoby do grupy" });
     }
@@ -277,6 +289,13 @@ function groupRoutes(app) {
     if (!me?.is_admin) return reply.code(403).send(ADMIN_ONLY);
 
     const isAdmin = !!makeAdmin;
+    if (!(await membership(groupId, userHash))) {
+      return reply.code(404).send({ error: "Ta osoba nie należy do grupy" });
+    }
+    if (!isAdmin) {
+      const { rows } = await db.query("SELECT created_by FROM groups WHERE id=$1", [groupId]);
+      if (rows[0]?.created_by === userHash) return reply.code(400).send({ error: "Nie można odebrać uprawnień twórcy" });
+    }
     await db.query("UPDATE conversation_participants SET is_admin=$3 WHERE conversation_id=$1 AND user_hash=$2", [groupId, userHash, isAdmin]);
     sendToAll(await memberHashes(groupId), { type: "group_admin_changed", groupId, userHash, isAdmin });
     return { ok: true };

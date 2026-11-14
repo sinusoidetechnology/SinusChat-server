@@ -211,18 +211,14 @@ async function handleCall({ userHash }, msg) {
 
 const ringKey = (userHash, groupId) => userHash + "|" + groupId;
 
-function wakeForGroupCall(userHash) {
-  wakeUser(userHash, "call").catch(() => {});
-}
-
-function watchRingAck(socket, member, groupId, call) {
+function watchRingAck(socket, member, groupId, call, callerHash) {
   const key = ringKey(member, groupId);
   pendingGcallRings.set(key, Date.now());
   setTimeout(() => {
     if (!pendingGcallRings.delete(key)) return;
     if (groupCalls.get(groupId) !== call || call.members.has(member)) return;
     dropConnection(member, socket);
-    wakeForGroupCall(member);
+    wakeForCall(member, callerHash);
   }, CALL_ACK_TIMEOUT_MS);
 }
 
@@ -230,8 +226,8 @@ async function ringMembers(groupId, call, callerHash) {
   if (!spendBudget("gr:" + groupId, 1, GCALL_RINGS_PER_GROUP_HOURLY)) return;
   for (const member of await withoutBlockers(await otherMemberHashes(groupId, callerHash), callerHash)) {
     const socket = connections.get(member);
-    if (!socket) wakeForGroupCall(member);
-    else if (socket.gcallAckSupported) watchRingAck(socket, member, groupId, call);
+    if (!socket) wakeForCall(member, callerHash);
+    else if (socket.gcallAckSupported) watchRingAck(socket, member, groupId, call, callerHash);
   }
 }
 

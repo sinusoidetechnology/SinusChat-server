@@ -56,6 +56,8 @@ const PENDING_REST_WAKE_MS = 1_000;
 // Wiadomości pobrane przez /api/messages/pending?confirm=1 bez potwierdzenia w /api/messages/received
 // w tym czasie wracają do kolejki.
 const PENDING_LEASE_MS = 60_000;
+const EPHEMERAL_MAX_B64 = 8 * 1024;
+const SEALED_PER_MINUTE = 600;
 const ACK_IDS_MAX = 500;
 const ACK_ID_MAX_CHARS = 110;
 
@@ -486,7 +488,7 @@ function messageRoutes(app) {
     return { ok: true, messageId, deliveredLive: live > 0, createdAt: now };
   });
 
-  app.post("/api/sealed", { config: perMinute(240) }, async (req, reply) => {
+  app.post("/api/sealed", { config: perMinute(SEALED_PER_MINUTE) }, async (req, reply) => {
     const { to, ak, id, payloadB64, ik } = req.body || {};
     if (
       typeof to !== "string" ||
@@ -511,6 +513,7 @@ function messageRoutes(app) {
     }
 
     const ephemeral = req.body.eph === true;
+    if (ephemeral && payloadB64.length > EPHEMERAL_MAX_B64) return reply.code(413).send({ error: "Wiadomość za duża" });
     if (sealedFlood(to)) return reply.code(429).send({ error: "Za dużo wiadomości" });
     if (!ephemeral && !spendBudget("r:" + to, payloadB64.length, SEALED_BUDGET_BYTES)) {
       return reply.code(429).send({ error: "Za dużo wiadomości" });

@@ -12,6 +12,7 @@ const SENDER_BUDGET_BYTES = 200 * 1024 * 1024;
 const SEALED_BUDGET_BYTES = 50 * 1024 * 1024;
 const HIDDEN_LOOKUP_LIMIT = 300;
 const DIRECT_TARGET_LIMIT = 500;
+const STRANGER_LOOKUP_LIMIT = 500;
 const LOOKUP_WINDOW_MS = DAY_MS;
 const SEALED_FLOOD_LIMIT = 600;
 const SEALED_WINDOW_MS = 60_000;
@@ -63,6 +64,10 @@ function lookupAllowed(kind, requester, target, limit) {
   if (budget.seen.size >= limit) return false;
   budget.seen.add(target);
   return true;
+}
+
+function strangerLookupAllowed(requester, target) {
+  return lookupAllowed("u", requester, target, STRANGER_LOOKUP_LIMIT);
 }
 
 function sealedFlood(to) {
@@ -444,6 +449,14 @@ async function knownContact(block, targetHash, requester, akB64) {
   return sharesGroup(requester, targetHash);
 }
 
+async function isKnownContact(requester, targetHash, akB64) {
+  try {
+    const { rows } = await db.query("SELECT ua_hash FROM users WHERE email_hash=$1", [targetHash]);
+    if (rows.length && accessKeyMatches(rows[0].ua_hash, akB64)) return true;
+  } catch (_) {}
+  return sharesGroup(requester, targetHash);
+}
+
 async function userExists(hash) {
   try {
     const { rows } = await db.query("SELECT 1 FROM users WHERE email_hash=$1", [String(hash)]);
@@ -467,6 +480,7 @@ module.exports = {
   clientIp,
   spendBudget,
   lookupAllowed,
+  strangerLookupAllowed,
   sealedFlood,
   searchAllowed,
   rememberBounded,
@@ -509,5 +523,6 @@ module.exports = {
   groupAllows,
   newChatsBlocked,
   knownContact,
+  isKnownContact,
   userExists,
 };
